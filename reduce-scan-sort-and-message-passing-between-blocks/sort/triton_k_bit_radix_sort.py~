@@ -1,0 +1,258 @@
+"""
+Triton <=3.3 has a bug and cannot produce correct result
+"""
+
+import torch
+import triton
+from triton import language as tl
+
+from triton_k_bit_global_hist import compute_global_hist_kernel, convert_to_uint_preverse_order
+from utils import generate_matrix
+
+@triton.jit
+def sweep(arr_ptr, associate_arr_ptr, , 
+          out_ptr, associate_out_ptr, # outputs
+          excumsum_bins_ptr, flag_ptr, aggregate_ptr, inclusive_prefix_ptr, # status
+          n_passes, pass_id, bit_offset, N, OUT_N, 
+          TILE_N: tl.constexpr, TILE_R: tl.constexpr, k_bits: tl.constexpr,
+          descending: tl.constexpr):
+    # r: num_bins = 2 ** k_bits
+    # OUT_N: grid_n = cdiv(N, )
+
+    # arr_ptr: (m, N)
+    # out_ptr: (m, N)
+    # excumsum_bins_ptr: (m, n_passes, r)
+    # flag_ptr: (m, r, OUT_N)
+    # aggregate_ptr: (m, r, OUT_N)
+    # inclusive_prefix_ptr: (m, r, OUT_N)
+    # grid: (m, grid_r, grid_n)
+
+    # load data
+    pid_n = tl.program_id(0) # TODO: use a global counter to avoid dead-lock
+    pid_r = tl.program_id(1)
+    pid_m = tl.program_id(2)
+
+    # initialize flag to zero-local sum is not ready
+    r: tl.constexpr = 2 ** k_bits
+    bfe_mask: tl.constexpr = (1 << k_bits) - 1 # a.k.a. 2 ** k_bits - 1
+    cta_r_start = pid_r * TILE_R
+    cta_r_end = tl.minimum(cta_r_start + TILE_R, r)
+
+    # write flags for (TILE_R,) once
+    bins = cta_r_start + tl.arange(0, TILE_R)
+    flag_offsets_ = pid_m * (r * OUT_N) + bins * OUT_N + pid_n # (TILE_R, )
+    tl.atomic_xchg(flag_ptr + flag_offsets_, 0, sem="release")
+
+    # cumsum for a bin_index
+    n_offsets = pid_n * TILE_N + tl.arange(0, TILE_N) # (TILE_N, )
+    mask = n_offsets < N
+    arr = tl.load(arr_ptr + pid_m * N + n_offsets, mask=mask)
+    arr_u = convert_to_uint_preverse_order(arr, descending)
+    key = (arr_u >> bit_offset) & bfe_mask # (TILE_N, )
+    # since triton can only use scalar as condition, loop by bin_index
+    for bin_index in tl.range(cta_r_start, cta_r_end, num_stages=2):
+        matches = tl.where(mask, key == bin_index, False) # (TILE_N, )
+
+        # cta level cumsum per bin
+        local_sum = tl.sum(matches, axis=0) # scalar
+        state_offset = pid_m * (r * OUT_N) + bin_index * OUT_N + pid_n
+        flag_offset = pid_m * (r * OUT_N) + bin_index * OUT_N + pid_n
+        tl.store(aggregate_ptr + state_offset, local_sum)
+        tl.atomic_xchg(flag_ptr + flag_offset, 1, sem="release")
+
+        # decoupled lookback
+        exclusive_prefix = tl.zeros((), dtype=tl.int64)
+        i_lookback = pid_n - 1
+        while i_lookback >= 0:
+            state_offset_i = pid_m * (r * OUT_N) + bin_index * OUT_N + i_lookback
+            flag_offset_i = pid_m * (r * OUT_N) + bin_index * OUT_N + i_lookback
+            flag = tl.atomic_add(flag_ptr + flag_offset_i, 0, sem="acquire")
+            while flag == 0:
+                flag = tl.atomic_add(flag_ptr + flag_offset_i, 0, sem="acquire")
+            if flag == 1:
+                this_aggregate = tl.load(aggregate_ptr + state_offset_i)
+                exclusive_prefix += this_aggregate
+                i_lookback -= 1
+            else: # flag == 2
+                inclusive_prefix = tl.load(inclusive_prefix_ptr + state_offset_i)
+                exclusive_prefix += inclusive_prefix
+                i_lookback = -1 # go back to -1 to break to loop
+        tl.store(inclusive_prefix_ptr + state_offset, exclusive_prefix + local_sum)
+        tl.atomic_xchg(flag_ptr + flag_offset, 2, sem="release")
+
+        local_ex_cumsum = tl.cumsum(matches.to(tl.int64), axis=0) - matches # (TILE_N, )
+        ex_cumsum_in_bin = exclusive_prefix + local_ex_cumsum # global ex_cumsum_in_bin (TILE_N, ) 
+
+        # ex_cumsum_bins (m, n_passes, r)
+        ex_cumsum_bins = tl.load(excumsum_bins_ptr + pid_m * (n_passes * r) + pass_id * r + bin_index) # scalar
+        pos = ex_cumsum_bins + ex_cumsum_in_bin #(TILE_N, )
+        # tl.static_print(pos.shape)
+        # tl.static_print(arr.shape)
+        # tl.static_print(matches.shape)
+        tl.store(out_ptr + pid_m * N + pos, arr, mask=matches)
+        if associate_arr_ptr is not None:
+            associate_arr = tl.load(associate_arr_ptr + pid_m * N + n_offsets, mask=mask)
+            tl.store(associate_out_ptr + pid_m * N + pos, associate_arr, mask=matches)
+
+        # tl.store(out_ptr + pid_m * N + n_offsets, pos, mask=matches)
+
+
+def radix_sort(arr, k_bits=8, descending=False):
+    m, n = arr.shape
+    dtype = arr.dtype
+    num_bits = 1 if dtype == torch.bool else (arr.itemsize * 8)
+
+    TILE_N = 1024
+    tiles_n_per_cta = 8
+    CTA_TILE_N = tiles_n_per_cta * TILE_N
+
+    num_bins = 2 ** k_bits
+    n_passes = triton.cdiv(num_bits, k_bits)
+    TILE_R = 16
+
+    grid_n = triton.cdiv(n, CTA_TILE_N)
+    grid_for_global_hist = (grid_n, m, 1)
+
+    global_hist = torch.zeros((m, n_passes, num_bins), device=arr.device, dtype=torch.int64)
+    compute_global_hist_kernel[grid_for_global_hist](arr, global_hist, n_passes, n, tiles_n_per_cta, TILE_N, TILE_R, k_bits, descending)
+    ex_cumsum_bins = torch.cumsum(global_hist, -1) - global_hist
+
+    # test
+    # global_hist_ref = torch.zeros((m, n_passes, num_bins), device=arr.device, dtype=torch.int64)
+    # bfe_mask = (1 << k_bits) - 1
+    # for i in range(n_passes):
+    #     bit_offset = i * k_bits
+    #     key = (arr >> bit_offset) & bfe_mask
+    #     bins = torch.arange(0, 2 ** k_bits, dtype=torch.int32, device=arr.device) #(r, )
+    #     matches = bins[:, None] == key.unsqueeze(1)  #(m, r, N)
+    #     hist = torch.sum(matches, axis=-1) # m, r
+    #     global_hist_ref[:, i, :] = hist
+    # torch.testing.assert_close(global_hist, global_hist_ref)
+
+    # begin{validation}
+    if True:
+        global_hist_ref = torch.zeros((m, n_passes, num_bins), device=arr.device, dtype=torch.int64)
+        for p in range(n_passes):
+            bit_offset = p * k_bits
+            bfe_mask = (1 << k_bits) - 1
+            num_bins = 2 ** k_bits
+            key = (arr >> bit_offset) & bfe_mask
+            bins = torch.arange(num_bins, device=arr.device)
+            matches = (bins[:, None] == torch.unsqueeze(key, 1))
+            h = torch.sum(matches, -1)
+            global_hist_ref[:, p, :] = h
+        ex_cumsum_bins_ref = torch.cumsum(global_hist_ref, -1) - global_hist_ref
+        torch.testing.assert_close(global_hist, global_hist_ref)
+        torch.testing.assert_close(ex_cumsum_bins, ex_cumsum_bins_ref)
+    # end{validation}
+    
+    # sort
+    arr_in = torch.clone(arr)
+    indices_in = torch.arange(0, n, dtype=torch.int64, device=arr_in.device).broadcast_to((m, n)).contiguous()
+    arr_out = torch.empty_like(arr)
+    indices_out = torch.empty_like(indices_in)
+
+    TILE_R = 8
+    grid_r = triton.cdiv(num_bins, TILE_R)
+    TILE_N = 2048
+    grid_n = triton.cdiv(n, TILE_N)    
+    grid_for_sweep = (grid_n, grid_r, m)
+
+    flag = torch.empty((m, num_bins, grid_n), device=arr.device, dtype=torch.int64)
+    aggregate = torch.empty((m, num_bins, grid_n), device=arr.device, dtype=torch.int64)
+    inclusive_prefix = torch.empty((m, num_bins, grid_n), device=arr.device, dtype=torch.int64)
+
+    for i in range(0, n_passes):
+        bit_offset = i * k_bits
+        sweep[grid_for_sweep](arr_in, indices_in, arr_out, indices_out, ex_cumsum_bins, flag, aggregate, inclusive_prefix, 
+                              n_passes, i, bit_offset, n, grid_n, TILE_N, TILE_R, k_bits, descending)
+        # print(f"< sorted last {bit_offset + k_bits:>2d} bits: {arr_out}")
+        arr_in, arr_out = arr_out, arr_in
+        indices_in, indices_out = indices_out, indices_in
+        
+    return arr_in, indices_in
+
+
+def test(dtype, descending):
+    print(f"======= START: {dtype=}, {descending=} =======")
+    m = 8
+    n = 128 * 1024
+    x = generate_matrix(m, n, dtype)
+
+    K = 1 if dtype == torch.bool else 4
+    # since torch sort & bitwise operation has no kernel for many uint dtypes
+    # we move it to the cpu for computing a reference
+    try:
+        out = torch.sort(x, dim=-1, stable=True, descending=descending)
+    except:
+        x_ref = x.to(torch.device("cpu"))
+        out = torch.sort(x_ref, dim=-1, stable=True, descending=descending)
+
+    for _ in range(100): # test it repeatedly to ensure it is correct
+        out2 = radix_sort(x, k_bits=K, descending=descending)
+        d = x.device
+        torch.testing.assert_close(out2[0], out[0].to(d), atol=0, rtol=0)
+        torch.testing.assert_close(out2[1], out[1].to(d), atol=0, rtol=0)
+
+
+
+def bench(dtype):
+    m = 16
+    n = 128 * 1024
+    K = 1 if dtype == torch.bool else 4
+    x = generate_matrix(m, n, dtype)
+    sorted1, indices1 = torch.sort(x, stable=True, dim=-1)
+    sorted2, indices2 = radix_sort(x, k_bits=K)
+    torch.testing.assert_close(sorted2, sorted1, rtol=0, atol=0)
+    torch.testing.assert_close(indices2, indices1, rtol=0, atol=0)
+
+    t1 = triton.testing.do_bench(lambda: torch.sort(x, stable=True, dim=-1))
+    t2 = triton.testing.do_bench(lambda: radix_sort(x, k_bits=K))
+    print(f"torch: {t1:.3f} ms, triton: {t2:.3f} ms")
+
+if __name__ == "__main__":
+    test(torch.bool, False)
+    test(torch.bool, True)
+
+    test(torch.int8, False)
+    test(torch.int8, True)  
+
+    test(torch.int16, False)
+    test(torch.int16, True)  
+
+    test(torch.int32, False)
+    test(torch.int32, True)
+
+    test(torch.int64, False)
+    test(torch.int64, True)
+
+    test(torch.uint8, False)
+    test(torch.uint8, True)  
+
+    test(torch.uint16, False)
+    test(torch.uint16, True)  
+
+    test(torch.uint32, False)
+    test(torch.uint32, True)  
+
+    test(torch.uint64, False)
+    test(torch.uint64, True)  
+
+
+    test(torch.bfloat16, False)
+    test(torch.bfloat16, True)
+
+    test(torch.float16, False)
+    test(torch.float16, True)
+    
+    test(torch.float32, False)
+    test(torch.float32, True)
+
+    test(torch.float64, False)
+    test(torch.float64, True)
+
+    print("benchmarking: ")
+    bench(torch.int32)
+    bench(torch.int64)
+    bench(torch.float32)
+    
